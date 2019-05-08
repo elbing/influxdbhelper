@@ -6,7 +6,7 @@ import (
 	"strings"
 	"time"
 
-	influxClient "github.com/influxdata/influxdb/client/v2"
+	influxClient "github.com/influxdata/influxdb1-client/v2"
 )
 
 var reRemoveExtraSpace = regexp.MustCompile(`\s\s+`)
@@ -42,8 +42,14 @@ type Client interface {
 	// result data structure.
 	DecodeQuery(query string, result interface{}) error
 
+	// Same as above but chunked
+	DecodeQueryAsChunk(queryaschunk string, result interface{}) error
+
 	// WritePoint is used to write arbitrary data into InfluxDb.
 	WritePoint(data interface{}) error
+
+    // WritePoint is used to write arbitrary data into InfluxDb forcing TimeStamp.
+	WritePointTime(data interface{}, t time.Time) error
 
 	// WritePointTagsFields is used to write a point specifying tags and fields.
 	WritePointTagsFields(tags map[string]string, fields map[string]interface{}, t time.Time) error
@@ -106,6 +112,12 @@ func (c *helperClient) Write(bp influxClient.BatchPoints) error {
 // the UDP client.
 func (c *helperClient) Query(q influxClient.Query) (*influxClient.Response, error) {
 	return c.client.Query(q)
+}
+
+// Query makes an InfluxDB Query on the database. This will fail if using
+// the UDP client.
+func (c *helperClient) QueryAsChunk(q influxClient.Query) (*influxClient.ChunkedResponse, error) {
+	return c.client.QueryAsChunk(q)
 }
 
 // Close releases any resources a Client may be using.
@@ -190,6 +202,43 @@ func (c *helperClient) DecodeQuery(q string, result interface{}) (err error) {
 	return
 }
 
+// Same as above, probably won't work
+func (c *helperClient) DecodeQueryAsChunk(q string, result interface{}) (err error) {
+	if c.using == nil || c.using.db == nil {
+		return fmt.Errorf("no db set for query")
+	}
+
+	query := influxClient.Query{
+		Command:   q,
+		Database:  c.using.db.value,
+		Chunked:   false,
+		ChunkSize: 100,
+	}
+
+	var response *influxClient.Response
+	response, err = c.client.Query(query)
+	if !c.using.db.retain {
+		c.using.db = nil
+	}
+
+	if response.Error() != nil {
+		return response.Error()
+	}
+
+	if err != nil {
+		return
+	}
+
+	results := response.Results
+	if len(results) < 1 || len(results[0].Series) < 1 {
+		return
+	}
+
+	err = decode(results[0].Series, result)
+
+	return
+}
+
 // WritePoint is used to write arbitrary data into InfluxDb.
 //
 // data must be a struct with struct field tags that defines the names used
@@ -213,6 +262,26 @@ func (c *helperClient) WritePoint(data interface{}) error {
 	}
 
 	return c.WritePointTagsFields(tags, fields, t)
+}
+
+// Same as above but forcing timestamp
+
+func (c *helperClient) WritePointTime(data interface{}, t time.Time) error {
+	if c.using == nil || c.using.db == nil {
+		return fmt.Errorf("no db set for query")
+	}
+
+	t1, tags, fields, measurement, err := encodetime(data, c.using.timeField, t)
+
+	if c.using.measurement == nil {
+		c.using.measurement = &usingValue{measurement, false}
+	}
+
+	if err != nil {
+		return err
+	}
+
+	return c.WritePointTagsFields(tags, fields, t1)
 }
 
 // WritePointTagsFields is used to write a point specifying tags and fields.
